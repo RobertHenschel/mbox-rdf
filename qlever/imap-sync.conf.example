@@ -1,0 +1,38 @@
+[imap]
+host = imap.cendio.se
+port = 993
+username = robhe@cendio.se
+# Leave empty to read from IMAP_PASSWORD environment variable
+password =
+# Use STARTTLS instead of implicit TLS (set port to 143 for STARTTLS)
+starttls = false
+# IDLE re-check interval in seconds
+poll_interval = 300
+
+[qlever]
+endpoint = http://localhost:7029
+access_token = mbox_access_token
+
+[rdf]
+# Path to the mbox-rdf binary (relative to this config file's directory)
+binary = ../target/release/mbox-rdf
+data_iri = https://data.cendio.com/mbox/user/
+include_body = true
+include_attachments = true
+
+[folders]
+# IMAP folder = graph IRI | canonical folder name
+# The canonical name is used in the RDF folder IRI (e.g. .../folder/Sent)
+# and must match what import.sh uses.
+INBOX = urn:email:robhe@cendio.com:INBOX | INBOX
+INBOX.Sent = urn:email:robhe@cendio.com:SENT | Sent
+
+[state]
+# File to persist last-seen UIDs (relative to this config file's directory)
+file = imap-sync.state.json
+
+[ipc]
+# Unix domain socket path for event notifications (empty = disabled)
+# Apps connect to this socket to receive real-time new_mail events.
+# See IPC_PROTOCOL.md for details.
+socket_path = /tmp/imap-sync.sock

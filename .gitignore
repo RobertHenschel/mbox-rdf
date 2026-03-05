@@ -28,4 +28,7 @@ qlever/Sent
 qlever/INBOX
 qlever/benchmark.sh
 qlever/import.sh
+qlever/imap-sync.conf
+qlever/imap-sync.state.json
 
+qlever/__pycache__/

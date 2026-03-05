@@ -91,9 +91,46 @@ qlever index  # Indexes the generated .nq.gz files
 qlever start  # Starts the SPARQL endpoint
 ```
 
+## Live IMAP Sync
+
+The `imap-sync.py` daemon monitors IMAP folders in real-time via IDLE and inserts new messages into QLever as they arrive.
+
+### Setup
+
+```bash
+cd qlever
+pip install -r requirements-sync.txt
+cp imap-sync.conf.example imap-sync.conf
+# Edit imap-sync.conf with your IMAP credentials and settings
+```
+
+### Running
+
+```bash
+cd qlever
+python3 imap-sync.py
+```
+
+The daemon logs all operations to stdout. Press Ctrl+C to stop. It persists its state (last-seen UID per folder) to `imap-sync.state.json` and resumes from where it left off on restart.
+
+### stdin mode
+
+The `mbox-rdf` binary also supports reading a single RFC 822 message from stdin:
+
+```bash
+cat message.eml | mbox-rdf --stdin \
+  --folder-name INBOX \
+  --graph-iri urn:email:user@example.com:INBOX \
+  --include-body
+```
+
+### Interaction with benchmark.sh
+
+Stop the daemon before running `benchmark.sh` (it checks and refuses to run if the daemon is active). After `benchmark.sh` completes, restart the daemon manually. The deduplication check ensures no messages are inserted twice.
+
 ## Roadmap
 
-- [ ] **Incremental sync** — track the last processed byte offset per mbox file (stored in QLever as RDF), process only new messages, and INSERT DATA via SPARQL UPDATE. Full reindex is fast enough as a fallback.
+- [x] **Live IMAP sync** — real-time monitoring via IMAP IDLE with INSERT DATA to QLever.
 - [ ] **Text search** — implement QLever materialized views with `ql:has-word` for ranked keyword search over subjects (weight 5) and body text (weight 1). Waiting on [QLever PR #2579](https://github.com/ad-freiburg/qlever/pull/2579).
 - [ ] **URL extraction** — re-enable `mail:linksTo` by parsing `<a href>` from HTML parts instead of regex on plain text.
 

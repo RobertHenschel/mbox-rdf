@@ -1,12 +1,12 @@
 mod vocab;
 mod mbox;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use mbox::MboxFile;
 use mail_parser::{MessageParser, Address, Addr, MimeHeaders, HeaderValue};
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::Path;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -20,8 +20,11 @@ use std::sync::OnceLock;
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Input mbox file(s)
-    #[arg(required = true)]
     inputs: Vec<String>,
+
+    /// Read a single RFC 822 message from stdin instead of mbox files
+    #[arg(long, default_value_t = false)]
+    stdin: bool,
 
     /// Output path for RDF data (.nt or .nq, optionally .gz)
     #[arg(short, long, default_value = "mail.nt")]
@@ -62,7 +65,27 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let vocab = Vocab::new(DEFAULT_SCHEMA_IRI.to_string(), args.data_iri);
+
+    if !args.stdin && args.inputs.is_empty() {
+        bail!("Either provide input mbox file(s) or use --stdin");
+    }
+
+    let vocab = Vocab::new(DEFAULT_SCHEMA_IRI.to_string(), args.data_iri.clone());
+
+    if args.stdin {
+        let folder_name = args.folder_name.clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let folder_iri_str = vocab.folder_iri(&folder_name);
+
+        let mut raw_message = Vec::new();
+        std::io::stdin().read_to_end(&mut raw_message)
+            .context("Failed to read message from stdin")?;
+
+        let mut writer = BufWriter::new(std::io::stdout().lock());
+        process_message(&vocab, &raw_message, &folder_iri_str, "imap", args.include_body, args.include_attachments, args.max_attachment_size, args.graph_iri.as_deref(), &mut writer)?;
+        writer.flush()?;
+        return Ok(());
+    }
 
     let out_file = File::create(&args.output)
         .with_context(|| format!("Failed to create output file {}", args.output))?;
