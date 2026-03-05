@@ -20,3 +20,12 @@
 qlever/mbox.*
 Cargo.lock
 convert_all.sh
+qlever/2023
+qlever/2024
+qlever/2025
+qlever/2026
+qlever/Sent
+qlever/INBOX
+qlever/benchmark.sh
+qlever/import.sh
+
