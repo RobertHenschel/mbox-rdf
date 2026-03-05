@@ -19,6 +19,7 @@ TEXT_INDEX      = from_literals
 PORT               = 7029
 ACCESS_TOKEN       = mbox_access_token
 MEMORY_FOR_QUERIES = 5G
+PERSIST_UPDATES    = true
 
 [runtime]
 SYSTEM = native

@@ -88,6 +88,11 @@ mail:bodyText rdf:type rdf:Property ;
     rdfs:domain mail:Message ;
     rdfs:range xsd:string .
 
+mail:bodyHtml rdf:type rdf:Property ;
+    rdfs:label "HTML body content" ;
+    rdfs:domain mail:Message ;
+    rdfs:range xsd:string .
+
 mail:folder rdf:type rdf:Property ;
     rdfs:label "Folder containing the message" ;
     rdfs:domain mail:Message ;

@@ -299,34 +299,13 @@ fn process_message<W: Write>(
     process_addresses(&mut triples, &s, &vocab.term("bcc"), msg.bcc(), vocab, graph_iri);
 
     // Body & Link Extraction
-    if let Some(body) = msg.body_text(0) {
-        if include_body {
-            add_literal_triple(&mut triples, &s, &vocab.term("bodyText"), &body, graph_iri);
+    if include_body {
+        if let Some(text) = msg.body_text(0) {
+            add_literal_triple(&mut triples, &s, &vocab.term("bodyText"), &text, graph_iri);
         }
-        
-        /*
-        // Extract links
-        static URL_RE: OnceLock<Regex> = OnceLock::new();
-        let url_re = URL_RE.get_or_init(|| Regex::new(r#"(?i)https?://[^\s<>"'()\[\]]+"#).unwrap());
-        for mat in url_re.find_iter(&body) {
-            let mut url = mat.as_str();
-            // Basic trailing punctuation cleanup
-            while url.ends_with('.') || url.ends_with(',') || url.ends_with(';') || url.ends_with(':') || url.ends_with(']') || url.ends_with(')') {
-                url = &url[..url.len() - 1];
-            }
-            
-            // Skip empty or trivial URLs
-            if url.len() <= 8 || !url.contains("://") {
-                continue;
-            }
-            let host_part = &url[url.find("://").unwrap() + 3..];
-            if host_part.is_empty() {
-                continue;
-            }
-
-            add_iri_triple(&mut triples, &s, &vocab.term("linksTo"), &sanitize_iri(url), graph_iri);
+        if let Some(html) = msg.body_html(0) {
+            add_literal_triple(&mut triples, &s, &vocab.term("bodyHtml"), &html, graph_iri);
         }
-        */
     }
 
     // Attachments (schema:MediaObject)
@@ -420,6 +399,7 @@ fn escape_nt(s: &str) -> String {
      .replace('\t', "\\t")
 }
 
+#[allow(dead_code)]
 fn sanitize_iri(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     for c in s.chars() {

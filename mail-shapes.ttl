@@ -84,6 +84,11 @@ mail:MessageShape a sh:NodeShape ;
     sh:maxCount 1 ;
   ] ;
   sh:property [
+    sh:path mail:bodyHtml ;
+    sh:datatype xsd:string ;
+    sh:maxCount 1 ;
+  ] ;
+  sh:property [
     sh:path mail:thread ;
     sh:class mail:Thread ;
     sh:maxCount 1 ;

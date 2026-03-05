@@ -40,6 +40,7 @@ An email message. Every message also has type `schema:CreativeWork`.
 | `schema:dateReceived` | `xsd:dateTime` | 0..1 | Date received (from Received header) |
 | `mail:userAgent` | `xsd:string` | 0..1 | Mail client (User-Agent/X-Mailer) |
 | `mail:bodyText` | `xsd:string` | 0..1 | Plain text body (only if enabled) |
+| `mail:bodyHtml` | `xsd:string` | 0..1 | HTML body (only if message has HTML part, requires --include-body) |
 | `mail:thread` | `mail:Thread` (IRI) | 0..1 | Conversation thread |
 | `mail:belongsToList` | `mail:MailingList` (IRI) | 0..1 | Mailing list |
 | `mail:attachmentCount` | `xsd:integer` | 0..1 | Number of attachments (only if > 0) |
