@@ -303,8 +303,12 @@ fn process_message<W: Write>(
         if let Some(text) = msg.body_text(0) {
             add_literal_triple(&mut triples, &s, &vocab.term("bodyText"), &text, graph_iri);
         }
-        if let Some(html) = msg.body_html(0) {
-            add_literal_triple(&mut triples, &s, &vocab.term("bodyHtml"), &html, graph_iri);
+        if let Some(part) = msg.html_part(0) {
+            if matches!(&part.body, mail_parser::PartType::Html(_)) {
+                if let Some(html) = msg.body_html(0) {
+                    add_literal_triple(&mut triples, &s, &vocab.term("bodyHtml"), &html, graph_iri);
+                }
+            }
         }
     }
 
