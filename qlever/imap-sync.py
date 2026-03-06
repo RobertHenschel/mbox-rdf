@@ -3,9 +3,12 @@
 
 Monitors IMAP folders via IDLE, converts new messages to RDF using the
 mbox-rdf binary, and inserts them into QLever via SPARQL UPDATE.
+Performs full UID-diff sync: new messages are inserted, deleted messages
+are removed from the RDF store.
 """
 
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -17,6 +20,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import quote
 
 try:
     from imapclient import IMAPClient
@@ -189,6 +193,46 @@ def escape_sparql(s):
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
 
 
+def compute_message_iri(data_iri, message_id, raw_bytes):
+    """Compute the message IRI the same way the Rust binary does.
+
+    With a Message-ID: data_iri/msg/<url-encoded-id>
+    Without: data_iri/msg/sha256/<hex-digest>
+    """
+    base = data_iri.rstrip("/") + "/"
+    if message_id:
+        return f"{base}msg/{quote(message_id, safe='')}"
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    return f"{base}msg/sha256/{digest}"
+
+
+def delete_message_triples(endpoint, access_token, graph_iri, msg_iri):
+    """Remove all triples for a message and its attachments from QLever.
+
+    Issues two DELETE WHERE operations:
+    1. Delete triples where attachment sub-resources are the subject
+       (found via schema:associatedMedia).
+    2. Delete all triples where the message IRI is the subject.
+    """
+    delete_attachments = (
+        f"DELETE WHERE {{\n"
+        f"  GRAPH <{graph_iri}> {{\n"
+        f"    <{msg_iri}> <http://schema.org/associatedMedia> ?att .\n"
+        f"    ?att ?p ?o .\n"
+        f"  }}\n"
+        f"}}"
+    )
+    delete_msg = (
+        f"DELETE WHERE {{\n"
+        f"  GRAPH <{graph_iri}> {{\n"
+        f"    <{msg_iri}> ?p ?o .\n"
+        f"  }}\n"
+        f"}}"
+    )
+    post_update(endpoint, access_token, delete_attachments)
+    post_update(endpoint, access_token, delete_msg)
+
+
 def convert_message(binary_path, raw_bytes, folder_name, graph_iri, data_iri, include_body, include_attachments):
     """Pipe raw RFC 822 bytes through mbox-rdf --stdin and return N-Quads lines."""
     cmd = [
@@ -243,10 +287,24 @@ def post_update(endpoint, access_token, sparql_update):
 
 
 def load_state(state_file):
-    """Load last-seen UIDs from state file."""
+    """Load sync state from file.
+
+    New format per folder:
+      { "uids": { "<uid>": { "msg_iri": "...", "message_id": "..." } },
+        "uidvalidity": <int> }
+    Automatically migrates old watermark format (folder -> int).
+    """
     if os.path.exists(state_file):
         with open(state_file) as f:
-            return json.load(f)
+            raw = json.load(f)
+        migrated = False
+        for key, val in list(raw.items()):
+            if isinstance(val, int):
+                raw[key] = {"uids": {}, "uidvalidity": None}
+                migrated = True
+        if migrated:
+            log("state", "INFO", "Migrated state file from watermark format (old UIDs forgotten)")
+        return raw
     return {}
 
 
@@ -269,7 +327,12 @@ def save_state(state_file, state):
 
 
 def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_file, state_lock):
-    """Main loop for one IMAP folder. Runs in its own thread."""
+    """Main loop for one IMAP folder. Runs in its own thread.
+
+    Performs full UID-diff sync on each cycle: fetches the complete set of
+    UIDs from the server, compares against the stored set, inserts new
+    messages, and deletes triples for messages that have been removed.
+    """
     host = config.get("imap", "host")
     port = config.getint("imap", "port", fallback=993)
     username = config.get("imap", "username")
@@ -295,27 +358,80 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
             client.login(username, password)
             log(folder_name, "INFO", f"Connected as {username}")
 
-            client.select_folder(folder_name, readonly=True)
+            select_info = client.select_folder(folder_name, readonly=True)
+            server_uidvalidity = select_info.get(b"UIDVALIDITY")
             backoff = 5
 
-            while not shutdown_event.is_set():
+            with state_lock:
+                folder_state = state.setdefault(folder_name, {"uids": {}, "uidvalidity": None})
+                stored_uidvalidity = folder_state.get("uidvalidity")
+
+            if server_uidvalidity and stored_uidvalidity and server_uidvalidity != stored_uidvalidity:
+                log(folder_name, "WARN",
+                    f"UIDVALIDITY changed ({stored_uidvalidity} -> {server_uidvalidity}), resetting state")
                 with state_lock:
-                    last_uid = state.get(folder_name, 0)
+                    folder_state["uids"] = {}
+                    folder_state["uidvalidity"] = server_uidvalidity
+                    save_state(state_file, state)
 
-                log(folder_name, "INFO", f"Last seen UID: {last_uid}, searching for new messages...")
+            if server_uidvalidity:
+                with state_lock:
+                    folder_state["uidvalidity"] = server_uidvalidity
 
-                if last_uid == 0:
-                    uids = client.search(["ALL"])
-                else:
-                    uids = client.search(["UID", f"{last_uid + 1}:*"])
-                    uids = [u for u in uids if u > last_uid]
+            while not shutdown_event.is_set():
+                server_uids = set(client.search(["ALL"]))
 
-                if uids:
-                    log(folder_name, "INFO", f"Found {len(uids)} new message(s) (UIDs {uids[0]}-{uids[-1]})")
-                else:
-                    log(folder_name, "INFO", "No new messages")
+                with state_lock:
+                    known_uids = {int(u) for u in folder_state.get("uids", {})}
 
-                for uid in uids:
+                new_uids = sorted(server_uids - known_uids)
+                deleted_uids = sorted(known_uids - server_uids)
+
+                log(folder_name, "INFO",
+                    f"Server has {len(server_uids)} messages, "
+                    f"we know {len(known_uids)}: "
+                    f"{len(new_uids)} new, {len(deleted_uids)} deleted")
+
+                # --- Handle deletions ---
+                for uid in deleted_uids:
+                    if shutdown_event.is_set():
+                        break
+
+                    with state_lock:
+                        uid_info = folder_state["uids"].get(str(uid), {})
+                    msg_iri = uid_info.get("msg_iri")
+                    if not msg_iri:
+                        log(folder_name, "WARN", f"UID {uid}: deleted on server but no IRI stored, removing from state only")
+                        with state_lock:
+                            folder_state["uids"].pop(str(uid), None)
+                            save_state(state_file, state)
+                        continue
+
+                    subject = uid_info.get("subject", "(unknown)")
+                    log(folder_name, "INFO", f'UID {uid}: deleted on server, removing triples for "{subject}"')
+
+                    try:
+                        delete_message_triples(endpoint, access_token, graph_iri, msg_iri)
+                        log(folder_name, "INFO", f"UID {uid}: triples deleted")
+                        if _event_bus:
+                            _event_bus.broadcast({
+                                "event": "delete_mail",
+                                "folder": folder_name,
+                                "graph": graph_iri,
+                                "uid": uid,
+                                "message_id": uid_info.get("message_id"),
+                                "msg_iri": msg_iri,
+                                "subject": subject,
+                            })
+                    except Exception as e:
+                        log(folder_name, "ERROR", f"UID {uid}: DELETE failed: {e}")
+
+                    with state_lock:
+                        folder_state["uids"].pop(str(uid), None)
+                        save_state(state_file, state)
+
+                # --- Handle new messages ---
+                for uid in new_uids:
                     if shutdown_event.is_set():
                         break
 
@@ -331,17 +447,23 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
 
                     log(folder_name, "INFO", f'UID {uid}: <{message_id or "?"}> "{subject}"')
 
+                    msg_iri = compute_message_iri(data_iri, message_id, raw_bytes)
+
                     if message_id and check_duplicate(endpoint, access_token, graph_iri, message_id):
-                        log(folder_name, "INFO", f"UID {uid}: already in store, skipping")
+                        log(folder_name, "INFO", f"UID {uid}: already in store, recording UID only")
                         with state_lock:
-                            state[folder_name] = uid
+                            folder_state["uids"][str(uid)] = {
+                                "msg_iri": msg_iri, "message_id": message_id, "subject": subject,
+                            }
                             save_state(state_file, state)
                         continue
 
                     if not message_id and check_duplicate_by_headers(endpoint, access_token, graph_iri, raw_bytes):
-                        log(folder_name, "INFO", f"UID {uid}: already in store (header match), skipping")
+                        log(folder_name, "INFO", f"UID {uid}: already in store (header match), recording UID only")
                         with state_lock:
-                            state[folder_name] = uid
+                            folder_state["uids"][str(uid)] = {
+                                "msg_iri": msg_iri, "message_id": message_id, "subject": subject,
+                            }
                             save_state(state_file, state)
                         continue
 
@@ -355,7 +477,9 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
                     if sparql is None:
                         log(folder_name, "WARN", f"UID {uid}: no triples produced, skipping")
                         with state_lock:
-                            state[folder_name] = uid
+                            folder_state["uids"][str(uid)] = {
+                                "msg_iri": msg_iri, "message_id": message_id, "subject": subject,
+                            }
                             save_state(state_file, state)
                         continue
 
@@ -378,7 +502,9 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
                         continue
 
                     with state_lock:
-                        state[folder_name] = uid
+                        folder_state["uids"][str(uid)] = {
+                            "msg_iri": msg_iri, "message_id": message_id, "subject": subject,
+                        }
                         save_state(state_file, state)
 
                 if shutdown_event.is_set():
@@ -425,12 +551,17 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
 
 
 def _run_init(config, folders, state_file):
-    """Connect to each folder, record the highest UID, save state, and exit."""
+    """Connect to each folder, fetch all UIDs and their Message-IDs, save state.
+
+    After init, the daemon knows every existing message and will only act on
+    changes (new arrivals or deletions).
+    """
     host = config.get("imap", "host")
     port = config.getint("imap", "port", fallback=993)
     username = config.get("imap", "username")
     password = config.get("imap", "password", fallback="") or os.environ.get("IMAP_PASSWORD", "")
     use_starttls = config.getboolean("imap", "starttls", fallback=False)
+    data_iri = config.get("rdf", "data_iri")
 
     log("init", "INFO", f"Connecting to {host}:{port} ({'STARTTLS' if use_starttls else 'TLS'})...")
     client = IMAPClient(host, port=port, ssl=(not use_starttls))
@@ -441,15 +572,35 @@ def _run_init(config, folders, state_file):
 
     state = load_state(state_file)
     for folder_name in folders:
-        client.select_folder(folder_name, readonly=True)
+        select_info = client.select_folder(folder_name, readonly=True)
+        uidvalidity = select_info.get(b"UIDVALIDITY")
         uids = client.search(["ALL"])
-        max_uid = max(uids) if uids else 0
-        state[folder_name] = max_uid
-        log("init", "INFO", f"{folder_name}: {len(uids)} messages, max UID = {max_uid}")
+        log("init", "INFO", f"{folder_name}: {len(uids)} messages, fetching Message-IDs...")
+
+        uid_map = {}
+        batch_size = 200
+        for i in range(0, len(uids), batch_size):
+            batch = uids[i:i + batch_size]
+            fetch_resp = client.fetch(batch, ["BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT)]"])
+            for uid in batch:
+                if uid not in fetch_resp:
+                    continue
+                header_key = b"BODY[HEADER.FIELDS (MESSAGE-ID SUBJECT)]"
+                header_bytes = fetch_resp[uid].get(header_key, b"")
+                message_id = extract_message_id(header_bytes)
+                subject_match = re.search(rb"^Subject:\s*(.+)", header_bytes, re.IGNORECASE | re.MULTILINE)
+                subject = subject_match.group(1).decode("utf-8", errors="replace").strip()[:60] if subject_match else ""
+                msg_iri = compute_message_iri(data_iri, message_id, b"")
+                uid_map[str(uid)] = {
+                    "msg_iri": msg_iri, "message_id": message_id, "subject": subject,
+                }
+
+        state[folder_name] = {"uids": uid_map, "uidvalidity": uidvalidity}
+        log("init", "INFO", f"{folder_name}: recorded {len(uid_map)} UIDs (UIDVALIDITY={uidvalidity})")
 
     client.logout()
     save_state(state_file, state)
-    log("init", "INFO", f"State saved to {state_file} -- daemon will only process new messages")
+    log("init", "INFO", f"State saved to {state_file} -- daemon will track changes from here")
 
 
 def main():
