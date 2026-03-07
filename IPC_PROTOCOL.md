@@ -1,6 +1,6 @@
 # imap-sync IPC Protocol
 
-The `imap-sync.py` daemon exposes a Unix domain socket that applications can connect to for **real-time notifications** when new email is inserted into QLever.
+The `imap-sync.py` daemon exposes a Unix domain socket that applications can connect to for **real-time notifications** when email is inserted into or deleted from QLever.
 
 ## Configuration
 
@@ -47,6 +47,32 @@ Emitted immediately after a new message is successfully inserted into QLever.
 | `message_id` | `string\|null` | RFC 822 Message-ID (without angle brackets), or `null` if the message had no Message-ID header |
 | `subject` | `string` | Subject line (truncated to 60 chars) |
 | `triples` | `int` | Number of RDF triples inserted |
+
+### `delete_mail`
+
+Emitted immediately after a deleted message's triples are removed from QLever.
+
+```json
+{
+  "event": "delete_mail",
+  "folder": "INBOX",
+  "graph": "urn:email:robhe@cendio.com:INBOX",
+  "uid": 7367,
+  "message_id": "abc123@example.com",
+  "msg_iri": "urn:email:robhe@cendio.com:INBOX/msg/abc123%40example.com",
+  "subject": "New text message from (832) 785-9370"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `event` | `string` | Always `"delete_mail"` |
+| `folder` | `string` | IMAP folder name (e.g. `"INBOX"`, `"INBOX.Sent"`) |
+| `graph` | `string` | QLever named graph IRI the triples were removed from |
+| `uid` | `int` | IMAP UID of the deleted message |
+| `message_id` | `string\|null` | RFC 822 Message-ID (without angle brackets), or `null` |
+| `msg_iri` | `string` | The RDF resource IRI that was deleted |
+| `subject` | `string` | Subject line (truncated to 60 chars) |
 
 ## Client Examples
 
@@ -109,7 +135,7 @@ A typical app integration looks like:
 
 1. On startup, run your initial SPARQL queries against QLever.
 2. Connect to the IPC socket in a background thread/task.
-3. When a `new_mail` event arrives:
+3. When a `new_mail` or `delete_mail` event arrives:
    - Check `event.graph` to see which graph changed.
    - Re-run any queries that depend on that graph.
    - Update the UI or notify the user.
@@ -120,5 +146,5 @@ A typical app integration looks like:
 - Multiple clients can connect simultaneously.
 - The daemon cleans up the socket file on normal shutdown.
 - If the daemon crashes, a stale socket file may remain. The daemon removes it on next start.
-- Events are only emitted for newly inserted messages, not for skipped duplicates.
+- Events are only emitted for messages that are actually inserted or deleted, not for skipped duplicates.
 - The socket is local-only (Unix domain socket), so there are no network security concerns.
