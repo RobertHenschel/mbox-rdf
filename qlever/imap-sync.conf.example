@@ -36,3 +36,12 @@ file = imap-sync.state.json
 # Apps connect to this socket to receive real-time new_mail events.
 # See IPC_PROTOCOL.md for details.
 socket_path = /tmp/imap-sync.sock
+
+[sync]
+# Multi-device sync via a hidden IMAP folder.
+# All app-specific data (tags, follow-ups, address book) is replicated
+# through this folder so every device converges to the same state.
+# See SYNC_PROTOCOL.md for details.
+enabled = false
+folder = INBOX.mbox-rdf-sync
+device_id = my-device

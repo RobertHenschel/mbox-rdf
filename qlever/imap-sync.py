@@ -5,6 +5,9 @@ Monitors IMAP folders via IDLE, converts new messages to RDF using the
 mbox-rdf binary, and inserts them into QLever via SPARQL UPDATE.
 Performs full UID-diff sync: new messages are inserted, deleted messages
 are removed from the RDF store.
+
+Multi-device sync: app-specific data (tags, follow-ups, address book)
+is replicated across devices via a hidden IMAP folder.
 """
 
 import configparser
@@ -18,7 +21,10 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from email.policy import default as email_default_policy
 from pathlib import Path
 from urllib.parse import quote
 
@@ -191,6 +197,98 @@ def _ask_query(endpoint, access_token, query):
 def escape_sparql(s):
     """Escape a string for use inside SPARQL double quotes."""
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("\r", "\\r")
+
+
+# --- Multi-device sync constants and helpers ---
+
+SYNC_GRAPHS = [
+    "urn:email:robhe@cendio.com:tags",
+    "urn:email:robhe@cendio.com:sheet-tags",
+    "urn:email:robhe@cendio.com:addressbook",
+    "urn:email:robhe@cendio.com:followup",
+]
+
+SYNC_HEADER = "X-Mbox-RDF-Sync"
+SYNC_VERSION = "v1"
+
+
+def make_sync_message(device_id, events):
+    """Wrap a list of sync event dicts in an RFC 822 message for IMAP APPEND.
+
+    Each message carries one or more operations in a JSON array body.
+    """
+    msg = EmailMessage(policy=email_default_policy)
+    msg["From"] = f"mbox-rdf-sync@{device_id}"
+    msg["Subject"] = f"mbox-rdf sync ({len(events)} ops)"
+    msg["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    msg["Message-ID"] = f"<sync-{uuid.uuid4()}@{device_id}>"
+    msg[SYNC_HEADER] = SYNC_VERSION
+    msg["X-Sync-Device-ID"] = device_id
+    body = json.dumps(events, indent=2)
+    msg.set_content(body, subtype="plain", charset="utf-8")
+    return msg.as_bytes()
+
+
+def parse_sync_message(raw_bytes):
+    """Parse an RFC 822 sync message and return (device_id, events_list) or None."""
+    try:
+        header_end = raw_bytes.find(b"\r\n\r\n")
+        if header_end == -1:
+            header_end = raw_bytes.find(b"\n\n")
+        if header_end == -1:
+            return None
+
+        headers_raw = raw_bytes[:header_end]
+        sync_hdr = None
+        device_id = None
+        for line in headers_raw.split(b"\n"):
+            line = line.strip()
+            lower = line.lower()
+            if lower.startswith(b"x-mbox-rdf-sync:"):
+                sync_hdr = line.split(b":", 1)[1].strip().decode("utf-8", errors="replace")
+            elif lower.startswith(b"x-sync-device-id:"):
+                device_id = line.split(b":", 1)[1].strip().decode("utf-8", errors="replace")
+
+        if sync_hdr != SYNC_VERSION or not device_id:
+            return None
+
+        body_start = header_end + (4 if raw_bytes[header_end:header_end + 4] == b"\r\n\r\n" else 2)
+        body = raw_bytes[body_start:].decode("utf-8", errors="replace").strip()
+        events = json.loads(body)
+        if not isinstance(events, list):
+            events = [events]
+        return device_id, events
+    except Exception:
+        return None
+
+
+def sync_event_to_sparql(event):
+    """Convert a single sync event dict into a SPARQL UPDATE string."""
+    op = event.get("op")
+    graph = event.get("graph")
+    triples = event.get("triples", [])
+
+    if not graph or not triples:
+        return None
+
+    triple_lines = "\n".join(f"    {t}" for t in triples)
+
+    if op == "insert":
+        return f"INSERT DATA {{\n  GRAPH <{graph}> {{\n{triple_lines}\n  }}\n}}"
+    elif op == "delete":
+        return f"DELETE DATA {{\n  GRAPH <{graph}> {{\n{triple_lines}\n  }}\n}}"
+    elif op == "clear_subject":
+        subject_iri = event.get("subject_iri")
+        if not subject_iri:
+            return None
+        return (
+            f"DELETE WHERE {{\n"
+            f"  GRAPH <{graph}> {{\n"
+            f"    <{subject_iri}> ?p ?o .\n"
+            f"  }}\n"
+            f"}}"
+        )
+    return None
 
 
 def compute_message_iri(data_iri, message_id, raw_bytes):
@@ -550,6 +648,171 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
     log(folder_name, "INFO", "Thread stopped")
 
 
+def monitor_sync_folder(config, state, state_file, state_lock):
+    """Monitor the sync IMAP folder for events from other devices.
+
+    Similar to monitor_folder but instead of converting email to RDF,
+    it parses sync event messages and replays them as SPARQL UPDATEs.
+    Events from this device are skipped (already applied locally).
+    """
+    host = config.get("imap", "host")
+    port = config.getint("imap", "port", fallback=993)
+    username = config.get("imap", "username")
+    password = config.get("imap", "password", fallback="") or os.environ.get("IMAP_PASSWORD", "")
+    use_starttls = config.getboolean("imap", "starttls", fallback=False)
+    endpoint = config.get("qlever", "endpoint")
+    access_token = config.get("qlever", "access_token")
+    poll_interval = config.getint("imap", "poll_interval", fallback=300)
+    sync_folder = config.get("sync", "folder")
+    device_id = config.get("sync", "device_id")
+
+    folder_name = sync_folder
+    backoff = 5
+
+    while not shutdown_event.is_set():
+        client = None
+        try:
+            log(folder_name, "INFO", f"Connecting to {host}:{port} ({'STARTTLS' if use_starttls else 'TLS'})...")
+            client = IMAPClient(host, port=port, ssl=(not use_starttls))
+            if use_starttls:
+                client.starttls()
+            client.login(username, password)
+            log(folder_name, "INFO", f"Connected as {username}, device_id={device_id}")
+
+            try:
+                select_info = client.select_folder(folder_name, readonly=True)
+            except Exception:
+                log(folder_name, "INFO", f"Folder {folder_name} does not exist, creating it...")
+                client.create_folder(folder_name)
+                select_info = client.select_folder(folder_name, readonly=True)
+
+            server_uidvalidity = select_info.get(b"UIDVALIDITY")
+            backoff = 5
+
+            state_key = f"_sync:{folder_name}"
+            with state_lock:
+                folder_state = state.setdefault(state_key, {"uids": {}, "uidvalidity": None})
+                stored_uidvalidity = folder_state.get("uidvalidity")
+
+            if server_uidvalidity and stored_uidvalidity and server_uidvalidity != stored_uidvalidity:
+                log(folder_name, "WARN",
+                    f"UIDVALIDITY changed ({stored_uidvalidity} -> {server_uidvalidity}), resetting state")
+                with state_lock:
+                    folder_state["uids"] = {}
+                    folder_state["uidvalidity"] = server_uidvalidity
+                    save_state(state_file, state)
+
+            if server_uidvalidity:
+                with state_lock:
+                    folder_state["uidvalidity"] = server_uidvalidity
+
+            while not shutdown_event.is_set():
+                server_uids = set(client.search(["ALL"]))
+
+                with state_lock:
+                    known_uids = {int(u) for u in folder_state.get("uids", {})}
+
+                new_uids = sorted(server_uids - known_uids)
+
+                if new_uids:
+                    log(folder_name, "INFO", f"{len(new_uids)} new sync event(s) to process")
+
+                for uid in new_uids:
+                    if shutdown_event.is_set():
+                        break
+
+                    fetch_resp = client.fetch([uid], ["RFC822"])
+                    if uid not in fetch_resp:
+                        log(folder_name, "WARN", f"UID {uid}: FETCH returned no data, skipping")
+                        with state_lock:
+                            folder_state["uids"][str(uid)] = {"skipped": True}
+                            save_state(state_file, state)
+                        continue
+
+                    raw_bytes = fetch_resp[uid][b"RFC822"]
+                    parsed = parse_sync_message(raw_bytes)
+                    if parsed is None:
+                        log(folder_name, "WARN", f"UID {uid}: not a valid sync message, skipping")
+                        with state_lock:
+                            folder_state["uids"][str(uid)] = {"skipped": True}
+                            save_state(state_file, state)
+                        continue
+
+                    source_device, events = parsed
+
+                    if source_device == device_id:
+                        with state_lock:
+                            folder_state["uids"][str(uid)] = {"device": source_device, "ops": len(events)}
+                            save_state(state_file, state)
+                        continue
+
+                    applied = 0
+                    for event in events:
+                        sparql = sync_event_to_sparql(event)
+                        if not sparql:
+                            continue
+                        try:
+                            post_update(endpoint, access_token, sparql)
+                            applied += 1
+                            if _event_bus:
+                                _event_bus.broadcast({
+                                    "event": "sync_update",
+                                    "op": event.get("op"),
+                                    "graph": event.get("graph"),
+                                    "subject_iri": event.get("subject_iri"),
+                                    "device_id": source_device,
+                                })
+                        except Exception as e:
+                            log(folder_name, "ERROR",
+                                f"UID {uid}: sync replay failed for {event.get('op')} on {event.get('graph')}: {e}")
+
+                    log(folder_name, "INFO",
+                        f"UID {uid}: from {source_device}, {applied}/{len(events)} ops applied")
+
+                    with state_lock:
+                        folder_state["uids"][str(uid)] = {"device": source_device, "ops": len(events)}
+                        save_state(state_file, state)
+
+                if shutdown_event.is_set():
+                    break
+
+                try:
+                    client.idle()
+                    all_responses = []
+                    elapsed = 0
+                    while elapsed < poll_interval and not shutdown_event.is_set():
+                        chunk = min(2, poll_interval - elapsed)
+                        responses = client.idle_check(timeout=chunk)
+                        if responses:
+                            all_responses.extend(responses)
+                            break
+                        elapsed += chunk
+                    client.idle_done()
+                    if all_responses:
+                        log(folder_name, "INFO", f"IDLE notification: {all_responses}")
+                except Exception as e:
+                    if shutdown_event.is_set():
+                        break
+                    log(folder_name, "WARN", f"IDLE error: {e}, reconnecting...")
+                    break
+
+        except Exception as e:
+            if shutdown_event.is_set():
+                break
+            log(folder_name, "ERROR", f"Connection error: {e}")
+            log(folder_name, "INFO", f"Reconnecting in {backoff}s...")
+            shutdown_event.wait(backoff)
+            backoff = min(backoff * 2, 300)
+        finally:
+            if client:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+
+    log(folder_name, "INFO", "Sync thread stopped")
+
+
 def _run_init(config, folders, state_file):
     """Connect to each folder, fetch all UIDs and their Message-IDs, save state.
 
@@ -603,11 +866,233 @@ def _run_init(config, folders, state_file):
     log("init", "INFO", f"State saved to {state_file} -- daemon will track changes from here")
 
 
+def _run_init_sync(config, state_file):
+    """Record all existing UIDs in the sync folder so the daemon doesn't re-process them.
+
+    Called automatically by --init when [sync] is enabled. This marks all
+    existing sync messages as known, so only new events trigger replays.
+    """
+    if not config.has_section("sync") or not config.getboolean("sync", "enabled", fallback=False):
+        return
+
+    host = config.get("imap", "host")
+    port = config.getint("imap", "port", fallback=993)
+    username = config.get("imap", "username")
+    password = config.get("imap", "password", fallback="") or os.environ.get("IMAP_PASSWORD", "")
+    use_starttls = config.getboolean("imap", "starttls", fallback=False)
+    sync_folder = config.get("sync", "folder")
+    device_id = config.get("sync", "device_id")
+
+    log("init", "INFO", f"Initializing sync folder {sync_folder}...")
+    client = IMAPClient(host, port=port, ssl=(not use_starttls))
+    if use_starttls:
+        client.starttls()
+    client.login(username, password)
+
+    try:
+        select_info = client.select_folder(sync_folder, readonly=True)
+    except Exception:
+        log("init", "INFO", f"Sync folder {sync_folder} does not exist, creating it...")
+        client.create_folder(sync_folder)
+        select_info = client.select_folder(sync_folder, readonly=True)
+
+    uidvalidity = select_info.get(b"UIDVALIDITY")
+    uids = client.search(["ALL"])
+
+    state = load_state(state_file)
+    state_key = f"_sync:{sync_folder}"
+    uid_map = {}
+    for uid in uids:
+        uid_map[str(uid)] = {"init": True}
+    state[state_key] = {"uids": uid_map, "uidvalidity": uidvalidity}
+
+    client.logout()
+    save_state(state_file, state)
+    log("init", "INFO", f"{sync_folder}: recorded {len(uid_map)} existing sync events (will skip on daemon start)")
+
+
+def _run_init_sync_replay(config, state_file):
+    """Replay ALL sync events from the IMAP sync folder into local QLever.
+
+    Used on a new device to bootstrap app-specific data. Unlike normal
+    init which just marks UIDs as known, this fetches and applies every event.
+    """
+    if not config.has_section("sync") or not config.getboolean("sync", "enabled", fallback=False):
+        print("ERROR: [sync] section not configured or not enabled", file=sys.stderr)
+        sys.exit(1)
+
+    host = config.get("imap", "host")
+    port = config.getint("imap", "port", fallback=993)
+    username = config.get("imap", "username")
+    password = config.get("imap", "password", fallback="") or os.environ.get("IMAP_PASSWORD", "")
+    use_starttls = config.getboolean("imap", "starttls", fallback=False)
+    endpoint = config.get("qlever", "endpoint")
+    access_token = config.get("qlever", "access_token")
+    sync_folder = config.get("sync", "folder")
+    device_id = config.get("sync", "device_id")
+
+    log("sync-replay", "INFO", f"Connecting to {host}:{port}...")
+    client = IMAPClient(host, port=port, ssl=(not use_starttls))
+    if use_starttls:
+        client.starttls()
+    client.login(username, password)
+
+    try:
+        select_info = client.select_folder(sync_folder, readonly=True)
+    except Exception:
+        log("sync-replay", "INFO", f"Sync folder {sync_folder} does not exist or is empty")
+        client.logout()
+        return
+
+    uidvalidity = select_info.get(b"UIDVALIDITY")
+    uids = client.search(["ALL"])
+    log("sync-replay", "INFO", f"{len(uids)} sync events to replay")
+
+    state = load_state(state_file)
+    state_key = f"_sync:{sync_folder}"
+    uid_map = {}
+    total_applied = 0
+
+    for uid in sorted(uids):
+        fetch_resp = client.fetch([uid], ["RFC822"])
+        if uid not in fetch_resp:
+            uid_map[str(uid)] = {"skipped": True}
+            continue
+
+        raw_bytes = fetch_resp[uid][b"RFC822"]
+        parsed = parse_sync_message(raw_bytes)
+        if parsed is None:
+            uid_map[str(uid)] = {"skipped": True}
+            continue
+
+        source_device, events = parsed
+        applied = 0
+        for event in events:
+            sparql = sync_event_to_sparql(event)
+            if not sparql:
+                continue
+            try:
+                post_update(endpoint, access_token, sparql)
+                applied += 1
+            except Exception as e:
+                log("sync-replay", "ERROR", f"UID {uid}: replay failed: {e}")
+
+        total_applied += applied
+        uid_map[str(uid)] = {"device": source_device, "ops": len(events)}
+
+    state[state_key] = {"uids": uid_map, "uidvalidity": uidvalidity}
+    client.logout()
+    save_state(state_file, state)
+    log("sync-replay", "INFO", f"Replay complete: {total_applied} operations applied from {len(uids)} messages")
+
+
+def _run_seed_sync(config):
+    """Export all app-specific graph data from QLever into the IMAP sync folder.
+
+    Queries each graph in SYNC_GRAPHS, converts the triples to sync events,
+    and APPENDs them to the sync IMAP folder. This is a one-time operation
+    to seed the sync log from the primary device.
+    """
+    if not config.has_section("sync") or not config.getboolean("sync", "enabled", fallback=False):
+        print("ERROR: [sync] section not configured or not enabled", file=sys.stderr)
+        sys.exit(1)
+
+    host = config.get("imap", "host")
+    port = config.getint("imap", "port", fallback=993)
+    username = config.get("imap", "username")
+    password = config.get("imap", "password", fallback="") or os.environ.get("IMAP_PASSWORD", "")
+    use_starttls = config.getboolean("imap", "starttls", fallback=False)
+    endpoint = config.get("qlever", "endpoint")
+    access_token = config.get("qlever", "access_token")
+    sync_folder = config.get("sync", "folder")
+    device_id = config.get("sync", "device_id")
+
+    log("seed", "INFO", f"Connecting to {host}:{port}...")
+    client = IMAPClient(host, port=port, ssl=(not use_starttls))
+    if use_starttls:
+        client.starttls()
+    client.login(username, password)
+    log("seed", "INFO", f"Connected as {username}")
+
+    try:
+        client.select_folder(sync_folder)
+    except Exception:
+        log("seed", "INFO", f"Creating folder {sync_folder}...")
+        client.create_folder(sync_folder)
+        client.select_folder(sync_folder)
+
+    total_events = 0
+    for graph in SYNC_GRAPHS:
+        query = f"SELECT ?s ?p ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}"
+        try:
+            resp = requests.get(
+                endpoint,
+                params={"query": query, "access-token": access_token},
+                headers={"Accept": "application/sparql-results+json"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            bindings = resp.json().get("results", {}).get("bindings", [])
+        except Exception as e:
+            log("seed", "ERROR", f"Query failed for {graph}: {e}")
+            continue
+
+        if not bindings:
+            log("seed", "INFO", f"{graph}: empty, skipping")
+            continue
+
+        events = []
+        batch_triples = []
+        for b in bindings:
+            s_val = b["s"]["value"]
+            p_val = b["p"]["value"]
+            o = b["o"]
+            s = f"<{s_val}>"
+            p = f"<{p_val}>"
+            if o["type"] == "uri":
+                o_str = f"<{o['value']}>"
+            elif o.get("datatype"):
+                o_escaped = o["value"].replace("\\", "\\\\").replace('"', '\\"')
+                o_str = f'"{o_escaped}"^^<{o["datatype"]}>'
+            else:
+                o_escaped = o["value"].replace("\\", "\\\\").replace('"', '\\"')
+                o_str = f'"{o_escaped}"'
+            batch_triples.append(f"{s} {p} {o_str} .")
+
+            if len(batch_triples) >= 50:
+                events.append({
+                    "op": "insert",
+                    "graph": graph,
+                    "triples": batch_triples,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+                batch_triples = []
+
+        if batch_triples:
+            events.append({
+                "op": "insert",
+                "graph": graph,
+                "triples": batch_triples,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+
+        if events:
+            raw_msg = make_sync_message(device_id, events)
+            client.append(sync_folder, raw_msg)
+            total_events += len(events)
+            log("seed", "INFO", f"{graph}: seeded {len(bindings)} triples in {len(events)} event(s)")
+
+    client.logout()
+    log("seed", "INFO", f"Seeding complete: {total_events} sync event(s) written to {sync_folder}")
+
+
 def main():
     script_dir = Path(__file__).resolve().parent
     config_path = script_dir / "imap-sync.conf"
 
     init_mode = "--init" in sys.argv
+    seed_sync_mode = "--seed-sync" in sys.argv
+    sync_replay_mode = "--sync-replay" in sys.argv
 
     if not config_path.exists():
         print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
@@ -632,9 +1117,23 @@ def main():
         graph_iri, canonical = parse_folder_config(raw_value)
         folders[imap_name] = (graph_iri, canonical or imap_name)
 
+    if seed_sync_mode:
+        _run_seed_sync(config)
+        return
+
+    if sync_replay_mode:
+        _run_init_sync_replay(config, state_file)
+        return
+
     if init_mode:
         _run_init(config, folders, state_file)
+        _run_init_sync(config, state_file)
         return
+
+    sync_enabled = (
+        config.has_section("sync")
+        and config.getboolean("sync", "enabled", fallback=False)
+    )
 
     socket_path = config.get("ipc", "socket_path", fallback="")
     if socket_path and not os.path.isabs(socket_path):
@@ -672,6 +1171,8 @@ def main():
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"{ts} [INFO] [main] Starting imap-sync daemon", flush=True)
     print(f"{ts} [INFO] [main] Monitoring folders: {', '.join(f'{f} -> {g} (as {c})' for f, (g, c) in folders.items())}", flush=True)
+    if sync_enabled:
+        print(f"{ts} [INFO] [main] Multi-device sync: enabled (folder={config.get('sync', 'folder')}, device={config.get('sync', 'device_id')})", flush=True)
     print(f"{ts} [INFO] [main] QLever endpoint: {config.get('qlever', 'endpoint')}", flush=True)
     print(f"{ts} [INFO] [main] State file: {state_file}", flush=True)
 
@@ -681,6 +1182,16 @@ def main():
             target=monitor_folder,
             args=(config, folder_name, graph_iri, canonical_name, state, state_file, state_lock),
             name=f"imap-{folder_name}",
+            daemon=True,
+        )
+        t.start()
+        threads.append(t)
+
+    if sync_enabled:
+        t = threading.Thread(
+            target=monitor_sync_folder,
+            args=(config, state, state_file, state_lock),
+            name="imap-sync",
             daemon=True,
         )
         t.start()

@@ -74,6 +74,28 @@ Emitted immediately after a deleted message's triples are removed from QLever.
 | `msg_iri` | `string` | The RDF resource IRI that was deleted |
 | `subject` | `string` | Subject line (truncated to 60 chars) |
 
+### `sync_update`
+
+Emitted when a sync event from another device has been replayed into local QLever. Only present when multi-device sync is enabled (see [SYNC_PROTOCOL.md](SYNC_PROTOCOL.md)).
+
+```json
+{
+  "event": "sync_update",
+  "op": "insert",
+  "graph": "urn:email:robhe@cendio.com:tags",
+  "subject_iri": "https://data.cendio.com/mbox/user/msg/abc123%40example.com",
+  "device_id": "mac-b"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `event` | `string` | Always `"sync_update"` |
+| `op` | `string` | The operation that was replayed (`"insert"`, `"delete"`, `"clear_subject"`) |
+| `graph` | `string` | The named graph that was modified |
+| `subject_iri` | `string\|null` | The primary subject IRI affected, if available |
+| `device_id` | `string` | Which device originated the change |
+
 ## Client Examples
 
 ### Python
