@@ -44,6 +44,68 @@ except ImportError:
 shutdown_event = threading.Event()
 
 
+def _harden_connection(client, sock_timeout=60, keepalive_idle=30, keepalive_interval=10, keepalive_count=3):
+    """Configure TCP keepalive and socket timeout on an IMAPClient's underlying socket.
+
+    After a macOS suspend/resume, TCP connections go stale silently. Keepalive
+    probes cause the OS to detect dead connections within ~(idle + interval*count)
+    seconds instead of hanging indefinitely.
+    """
+    try:
+        sock = client._imap.socket()
+    except Exception:
+        return
+    sock.settimeout(sock_timeout)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPALIVE"):
+        # macOS: seconds before first keepalive probe
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, keepalive_idle)
+    elif hasattr(socket, "TCP_KEEPIDLE"):
+        # Linux: seconds before first keepalive probe
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, keepalive_idle)
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, keepalive_interval)
+    if hasattr(socket, "TCP_KEEPCNT"):
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, keepalive_count)
+
+
+def _idle_wait(client, poll_interval, folder_name):
+    """Enter IMAP IDLE and wait for notifications or timeout.
+
+    Returns a list of IDLE responses (may be empty on timeout).
+    Raises on connection errors so the caller can reconnect.
+    """
+    client.idle()
+    try:
+        all_responses = []
+        elapsed = 0
+        while elapsed < poll_interval and not shutdown_event.is_set():
+            chunk = min(30, poll_interval - elapsed)
+            try:
+                responses = client.idle_check(timeout=chunk)
+            except (socket.timeout, OSError) as e:
+                log(folder_name, "WARN", f"IDLE socket error: {e}, will reconnect")
+                try:
+                    client.idle_done()
+                except Exception:
+                    pass
+                raise
+            if responses:
+                all_responses.extend(responses)
+                break
+            elapsed += chunk
+        client.idle_done()
+        return all_responses
+    except (socket.timeout, OSError):
+        raise
+    except Exception:
+        try:
+            client.idle_done()
+        except Exception:
+            pass
+        raise
+
+
 class EventBus:
     """Unix domain socket server that broadcasts JSON events to connected clients.
 
@@ -454,6 +516,7 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
             if use_starttls:
                 client.starttls()
             client.login(username, password)
+            _harden_connection(client)
             log(folder_name, "INFO", f"Connected as {username}")
 
             select_info = client.select_folder(folder_name, readonly=True)
@@ -610,17 +673,7 @@ def monitor_folder(config, folder_name, graph_iri, canonical_name, state, state_
 
                 log(folder_name, "INFO", f"Entering IDLE (timeout {poll_interval}s)...")
                 try:
-                    client.idle()
-                    all_responses = []
-                    elapsed = 0
-                    while elapsed < poll_interval and not shutdown_event.is_set():
-                        chunk = min(2, poll_interval - elapsed)
-                        responses = client.idle_check(timeout=chunk)
-                        if responses:
-                            all_responses.extend(responses)
-                            break
-                        elapsed += chunk
-                    client.idle_done()
+                    all_responses = _idle_wait(client, poll_interval, folder_name)
                     if all_responses:
                         log(folder_name, "INFO", f"IDLE notification received: {all_responses}")
                     elif not shutdown_event.is_set():
@@ -677,6 +730,7 @@ def monitor_sync_folder(config, state, state_file, state_lock):
             if use_starttls:
                 client.starttls()
             client.login(username, password)
+            _harden_connection(client)
             log(folder_name, "INFO", f"Connected as {username}, device_id={device_id}")
 
             try:
@@ -777,17 +831,7 @@ def monitor_sync_folder(config, state, state_file, state_lock):
                     break
 
                 try:
-                    client.idle()
-                    all_responses = []
-                    elapsed = 0
-                    while elapsed < poll_interval and not shutdown_event.is_set():
-                        chunk = min(2, poll_interval - elapsed)
-                        responses = client.idle_check(timeout=chunk)
-                        if responses:
-                            all_responses.extend(responses)
-                            break
-                        elapsed += chunk
-                    client.idle_done()
+                    all_responses = _idle_wait(client, poll_interval, folder_name)
                     if all_responses:
                         log(folder_name, "INFO", f"IDLE notification: {all_responses}")
                 except Exception as e:
