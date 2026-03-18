@@ -268,6 +268,7 @@ SYNC_GRAPHS = [
     "urn:email:robhe@cendio.com:sheet-tags",
     "urn:email:robhe@cendio.com:addressbook",
     "urn:email:robhe@cendio.com:followup",
+    "urn:email:robhe@cendio.com:saved-queries",
 ]
 
 SYNC_HEADER = "X-Mbox-RDF-Sync"
