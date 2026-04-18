@@ -23,6 +23,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from email.header import decode_header as _stdlib_decode_header
 from email.message import EmailMessage
 from email.policy import default as email_default_policy
 from pathlib import Path
@@ -184,7 +185,13 @@ _event_bus: EventBus | None = None
 
 def log(folder, level, msg):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"{ts} [{level}] [{folder}] {msg}", flush=True)
+    line = f"{ts} [{level}] [{folder}] {msg}"
+    if level == "ERROR":
+        print(f"\033[31m{line}\033[0m", flush=True)
+    elif level == "WARN":
+        print(f"\033[33m{line}\033[0m", flush=True)
+    else:
+        print(line, flush=True)
 
 
 def extract_message_id(raw_bytes):
@@ -394,8 +401,82 @@ def delete_message_triples(endpoint, access_token, graph_iri, msg_iri):
     post_update(endpoint, access_token, delete_msg)
 
 
+def _decode_rfc2047_value(raw_value):
+    """Decode RFC 2047 encoded-words in a header value to plain text."""
+    try:
+        parts = _stdlib_decode_header(raw_value)
+    except Exception:
+        return raw_value
+    decoded = []
+    for data, charset in parts:
+        if isinstance(data, bytes):
+            decoded.append(data.decode(charset or "ascii", errors="replace"))
+        else:
+            decoded.append(data)
+    return " ".join("".join(decoded).split())
+
+
+_STRUCTURED_HEADERS = {b"in-reply-to", b"references"}
+
+
+def _fix_encoded_headers(raw_bytes):
+    """Decode RFC 2047 encoded-words in In-Reply-To and References headers.
+
+    Some IMAP servers MIME-encode these structured headers in copies saved to
+    the Sent folder, which causes mbox-rdf to generate incorrect message URIs
+    (the encoded-word text becomes part of the URI instead of the Message-ID).
+    This rewrites the raw RFC 822 bytes so the converter sees clean IDs.
+    """
+    for sep in (b"\r\n\r\n", b"\n\n"):
+        boundary = raw_bytes.find(sep)
+        if boundary != -1:
+            break
+    else:
+        return raw_bytes
+
+    header_blob = raw_bytes[:boundary]
+    if b"=?" not in header_blob:
+        return raw_bytes
+
+    crlf = b"\r\n" if b"\r\n" in header_blob else b"\n"
+    lines = header_blob.split(crlf)
+
+    logical = []
+    for line in lines:
+        if line and line[:1] in (b" ", b"\t") and logical:
+            logical[-1].append(line)
+        else:
+            logical.append([line])
+
+    modified = False
+    result_parts = []
+    for group in logical:
+        full = crlf.join(group)
+        colon = full.find(b":")
+        if colon == -1:
+            result_parts.append(full)
+            continue
+
+        name_lower = full[:colon].strip().lower()
+        if name_lower not in _STRUCTURED_HEADERS or b"=?" not in full:
+            result_parts.append(full)
+            continue
+
+        original_name = full[:colon]
+        raw_value = full[colon + 1:].decode("utf-8", errors="replace")
+        decoded = _decode_rfc2047_value(raw_value)
+        result_parts.append(original_name + b": " + decoded.encode("utf-8"))
+        modified = True
+
+    if not modified:
+        return raw_bytes
+
+    return crlf.join(result_parts) + raw_bytes[boundary:]
+
+
 def convert_message(binary_path, raw_bytes, folder_name, graph_iri, data_iri, include_body, include_attachments):
     """Pipe raw RFC 822 bytes through mbox-rdf --stdin and return N-Quads lines."""
+    raw_bytes = _fix_encoded_headers(raw_bytes)
     cmd = [
         binary_path, "--stdin",
         "--folder-name", folder_name,
@@ -419,7 +500,7 @@ def nquads_to_insert_data(nquads_text, graph_iri):
     """Convert N-Quads output to an INSERT DATA SPARQL update."""
     graph_suffix = f" <{graph_iri}> ."
     triples = []
-    for line in nquads_text.strip().splitlines():
+    for line in nquads_text.strip().split("\n"):
         line = line.strip()
         if not line:
             continue
