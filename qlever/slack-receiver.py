@@ -60,7 +60,9 @@ MESSAGE_FIELDS = (
     "content",
 )
 
-PER_MESSAGE_FIELDS = ("author", "slackMessageId", "permalink", "content")
+PER_MESSAGE_FIELDS = ("author", "slackMessageId", "permalink", "content", "attachments", "reingest")
+
+MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
 BATCH_HEADER_FIELDS = (
     "teamId",
@@ -229,6 +231,8 @@ def bootstrap_graph(cfg: Config) -> None:
         f'<{SLACK_NS}capturedAt> <{RDFS_NS}label> "Timestamp when the message was captured" .',
         f'<{SLACK_NS}rawPayload> <{RDFS_NS}label> "Raw JSON of fields not otherwise modeled" .',
         f'<{SLACK_NS}tag> <{RDFS_NS}label> "User-assigned tag" .',
+        f'<{SLACK_NS}fileId> <{RDFS_NS}label> "Slack file id" .',
+        f'<{SLACK_NS}fileContents> <{RDFS_NS}label> "Attachment file bytes (base64)" .',
     ]
     body = "\n    ".join(triples)
     sparql = f"INSERT DATA {{\n  GRAPH <{cfg.graph_iri}> {{\n    {body}\n  }}\n}}"
@@ -291,11 +295,153 @@ def _extras_json(payload: dict, known_keys) -> str | None:
         return None
 
 
-def build_insert(cfg: Config, msg: dict, batch_captured_at: str | None) -> tuple[str, str | None, str]:
+def _attachment_iri(cfg: Config, team_id: str, file_id: str) -> str:
+    return (
+        f"{cfg.data_iri}team/{quote(team_id or 'unknown', safe='')}"
+        f"/file/{quote(file_id, safe='')}"
+    )
+
+
+def _infer_file_id(att: dict) -> str:
+    explicit = str(att.get("fileId") or "").strip()
+    if explicit:
+        return explicit
+    url = str(att.get("url") or "").strip()
+    if url:
+        return "sha256-" + hashlib.sha256(url.encode("utf-8")).hexdigest()
+    name = str(att.get("name") or "").strip()
+    if name:
+        return "sha256-" + hashlib.sha256(name.encode("utf-8")).hexdigest()
+    return ""
+
+
+_MIME_TO_EXT = {
+    "application/pdf": "pdf",
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/svg+xml": "svg",
+    "image/heic": "heic",
+    "video/mp4": "mp4",
+    "video/quicktime": "mov",
+    "video/webm": "webm",
+    "audio/mpeg": "mp3",
+    "audio/wav": "wav",
+    "audio/mp4": "m4a",
+    "audio/ogg": "ogg",
+    "text/plain": "txt",
+    "text/markdown": "md",
+    "text/csv": "csv",
+    "application/json": "json",
+    "application/xml": "xml",
+    "text/html": "html",
+    "application/zip": "zip",
+    "application/gzip": "gz",
+    "application/x-tar": "tar",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+}
+
+
+def _synth_name_from_mime(mime: str) -> str:
+    if not mime:
+        return ""
+    ext = _MIME_TO_EXT.get(mime.lower().strip(), "")
+    return f"attachment.{ext}" if ext else ""
+
+
+def _attachment_metadata_triples(
+    msg_iri: str, att_iri: str, att: dict, file_id: str
+) -> list[str]:
+    name = str(att.get("name") or "").strip()
+    url = str(att.get("url") or "").strip()
+    mime = str(att.get("mimeType") or "").strip()
+    size = att.get("size")
+    if not name:
+        name = _synth_name_from_mime(mime)
+    triples = [
+        f'<{msg_iri}> <{SCHEMA_NS}associatedMedia> <{att_iri}> .',
+        f'<{att_iri}> <{RDF_NS}type> <{SCHEMA_NS}MediaObject> .',
+        f'<{att_iri}> <{SLACK_NS}fileId> "{escape_sparql(file_id)}" .',
+    ]
+    if name:
+        triples.append(
+            f'<{att_iri}> <{SCHEMA_NS}name> "{escape_sparql(name)}" .'
+        )
+    if url:
+        triples.append(f'<{att_iri}> <{SCHEMA_NS}contentUrl> <{url}> .')
+    if mime:
+        triples.append(
+            f'<{att_iri}> <{SCHEMA_NS}encodingFormat> "{escape_sparql(mime)}" .'
+        )
+    if isinstance(size, int) and size > 0:
+        triples.append(
+            f'<{att_iri}> <{SCHEMA_NS}contentSize> "{size}"^^<{XSD_NS}integer> .'
+        )
+    return triples
+
+
+def _attachment_bytes_triple(att_iri: str, bytes_b64: str) -> str:
+    return (
+        f'<{att_iri}> <{SLACK_NS}fileContents> '
+        f'"{escape_sparql(bytes_b64)}"^^<{XSD_NS}base64Binary> .'
+    )
+
+
+def _synthesise_content(content: str, attachments: list) -> str:
+    if content and content.strip():
+        return content
+    if not attachments:
+        return content
+    names = []
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        name = str(att.get("name") or "").strip() or "attachment"
+        names.append(f"[file: {name}]")
+    if not names:
+        return content
+    return "\n".join(names)
+
+
+def _collect_attachment_plans(cfg: Config, team_id: str, msg_iri: str, attachments: list) -> list[dict]:
+    """Normalise incoming attachment dicts into plans with IRIs + triple lists."""
+    plans: list[dict] = []
+    if not isinstance(attachments, list):
+        return plans
+    for att in attachments:
+        if not isinstance(att, dict):
+            continue
+        file_id = _infer_file_id(att)
+        if not file_id:
+            continue
+        att_iri = _attachment_iri(cfg, team_id, file_id)
+        metadata = _attachment_metadata_triples(msg_iri, att_iri, att, file_id)
+        bytes_b64 = att.get("bytesBase64")
+        bytes_triple = None
+        if isinstance(bytes_b64, str) and bytes_b64:
+            bytes_triple = _attachment_bytes_triple(att_iri, bytes_b64)
+        plans.append(
+            {
+                "att_iri": att_iri,
+                "file_id": file_id,
+                "metadata_triples": metadata,
+                "bytes_triple": bytes_triple,
+            }
+        )
+    return plans
+
+
+def build_insert(cfg: Config, msg: dict, batch_captured_at: str | None) -> tuple[str, str | None, str, list[dict]]:
     """Build the INSERT DATA SPARQL for a single Slack message.
 
-    Returns (sparql, slack_message_id, msg_iri). slack_message_id may be None
-    if the payload didn't include one.
+    Returns (sparql, slack_message_id, msg_iri, attachment_plans).
+    slack_message_id may be None if the payload didn't include one.
     """
     slack_message_id = str(msg.get("slackMessageId") or "").strip()
     author = str(msg.get("author") or "").strip()
@@ -303,7 +449,9 @@ def build_insert(cfg: Config, msg: dict, batch_captured_at: str | None) -> tuple
     channel_id = str(msg.get("channelId") or "").strip()
     team_id = str(msg.get("teamId") or "").strip()
     permalink = str(msg.get("permalink") or "").strip()
-    content = str(msg.get("content") or "")
+    raw_content = str(msg.get("content") or "")
+    raw_attachments = msg.get("attachments") if isinstance(msg.get("attachments"), list) else []
+    content = _synthesise_content(raw_content, raw_attachments)
 
     msg_iri = _message_iri(cfg, team_id, channel_id, slack_message_id, author, content)
     channel_iri = _channel_iri(cfg, team_id, channel_id) if (team_id and channel_id) else None
@@ -371,9 +519,15 @@ def build_insert(cfg: Config, msg: dict, batch_captured_at: str | None) -> tuple
             f'<{msg_iri}> <{SLACK_NS}rawPayload> "{escape_sparql(extras)}" .'
         )
 
+    attachment_plans = _collect_attachment_plans(cfg, team_id, msg_iri, raw_attachments)
+    for plan in attachment_plans:
+        triples.extend(plan["metadata_triples"])
+        if plan["bytes_triple"]:
+            triples.append(plan["bytes_triple"])
+
     body = "\n    ".join(triples)
     sparql = f"INSERT DATA {{\n  GRAPH <{cfg.graph_iri}> {{\n    {body}\n  }}\n}}"
-    return sparql, (slack_message_id or None), msg_iri
+    return sparql, (slack_message_id or None), msg_iri, attachment_plans
 
 
 # --- Dedup + insert with per-message-id lock --------------------------------
@@ -420,12 +574,141 @@ class MessageLockRegistry:
 _locks = MessageLockRegistry()
 
 
+def _enrich_attachments(
+    cfg: Config, msg_iri: str, plans: list[dict]
+) -> tuple[int, int]:
+    """For an already-ingested message, add any missing attachment triples.
+
+    Returns (attachments_added, bytes_added).
+    """
+    attachments_added = 0
+    bytes_added = 0
+    for plan in plans:
+        att_iri = plan["att_iri"]
+        try:
+            has_meta = ask_query(
+                cfg,
+                f"ASK {{ GRAPH <{cfg.graph_iri}> {{ "
+                f"<{att_iri}> <{RDF_NS}type> <{SCHEMA_NS}MediaObject> "
+                f"}} }}",
+            )
+        except Exception as exc:
+            log("WARN", f"attachment ASK failed for {att_iri}: {exc}")
+            continue
+
+        if not has_meta:
+            body = "\n    ".join(plan["metadata_triples"])
+            sparql = (
+                f"INSERT DATA {{\n  GRAPH <{cfg.graph_iri}> {{\n    {body}\n  }}\n}}"
+            )
+            try:
+                post_update(cfg, sparql)
+                attachments_added += 1
+            except Exception as exc:
+                log("WARN", f"attachment INSERT failed for {att_iri}: {exc}")
+                continue
+
+        if plan["bytes_triple"]:
+            try:
+                has_bytes = ask_query(
+                    cfg,
+                    f"ASK {{ GRAPH <{cfg.graph_iri}> {{ "
+                    f"<{att_iri}> <{SLACK_NS}fileContents> ?x "
+                    f"}} }}",
+                )
+            except Exception as exc:
+                log("WARN", f"attachment bytes ASK failed for {att_iri}: {exc}")
+                continue
+            if not has_bytes:
+                sparql = (
+                    f"INSERT DATA {{\n  GRAPH <{cfg.graph_iri}> {{\n    "
+                    f"{plan['bytes_triple']}\n  }}\n}}"
+                )
+                try:
+                    post_update(cfg, sparql)
+                    bytes_added += 1
+                except Exception as exc:
+                    log("WARN", f"attachment bytes INSERT failed for {att_iri}: {exc}")
+                    continue
+    return attachments_added, bytes_added
+
+
+def _delete_message_triples(cfg: Config, msg_iri: str) -> None:
+    """Remove every triple for this Slack message IRI, plus the triples of any
+    schema:associatedMedia MediaObject it references, UNLESS that MediaObject
+    is still referenced by a different message (file shared across messages).
+
+    Intended for the `reingest` path, where the caller wants the next INSERT
+    to overwrite whatever was previously stored.
+    """
+    g = cfg.graph_iri
+    orphan_media_delete = (
+        f"DELETE {{ GRAPH <{g}> {{ ?att ?p ?o . }} }} "
+        f"WHERE {{ GRAPH <{g}> {{ "
+        f"<{msg_iri}> <{SCHEMA_NS}associatedMedia> ?att . "
+        f"?att ?p ?o . "
+        f"FILTER NOT EXISTS {{ "
+        f"?other <{SCHEMA_NS}associatedMedia> ?att . "
+        f"FILTER(?other != <{msg_iri}>) "
+        f"}} "
+        f"}} }}"
+    )
+    msg_delete = (
+        f"DELETE WHERE {{ GRAPH <{g}> {{ <{msg_iri}> ?p ?o . }} }}"
+    )
+    post_update(cfg, orphan_media_delete)
+    post_update(cfg, msg_delete)
+
+
 def ingest_message(cfg: Config, msg: dict, batch_captured_at: str | None) -> dict:
-    """Dedup + insert one Slack message. Returns a small status dict."""
-    sparql, slack_message_id, msg_iri = build_insert(cfg, msg, batch_captured_at)
+    """Dedup + insert one Slack message. Existing messages are enriched with
+    any new attachment metadata/bytes. Returns a status dict including
+    attachments_added and bytes_added counters.
+
+    If the payload sets ``reingest: true`` (used by the right-click "Tag
+    Message" flow), all existing triples for the message are deleted first and
+    the message is reinserted fresh.
+    """
+    sparql, slack_message_id, msg_iri, attachment_plans = build_insert(
+        cfg, msg, batch_captured_at
+    )
+    reingest = bool(msg.get("reingest"))
 
     lock = _locks.acquire(slack_message_id)
     try:
+        if reingest:
+            try:
+                _delete_message_triples(cfg, msg_iri)
+            except Exception as exc:
+                log("ERROR", f"reingest delete failed for {msg_iri}: {exc}")
+                return {"ok": False, "error": f"reingest delete failed: {exc}"}
+            try:
+                post_update(cfg, sparql)
+            except Exception as exc:
+                log("ERROR", f"reingest INSERT failed for {msg_iri}: {exc}")
+                return {"ok": False, "error": f"insert failed: {exc}"}
+
+            inserted_attachments = len(attachment_plans)
+            inserted_bytes = sum(1 for p in attachment_plans if p["bytes_triple"])
+            log(
+                "INFO",
+                f"reingested {msg_iri}"
+                + (f" (id={slack_message_id})" if slack_message_id else "")
+                + (
+                    f" attachments_added={inserted_attachments} bytes_added={inserted_bytes}"
+                    if inserted_attachments
+                    else ""
+                ),
+            )
+            return {
+                "ok": True,
+                "duplicate": False,
+                "reingested": True,
+                "msgIRI": msg_iri,
+                "attachments_added": inserted_attachments,
+                "bytes_added": inserted_bytes,
+            }
+
         if slack_message_id:
             try:
                 exists = ask_query(
@@ -437,9 +720,6 @@ def ingest_message(cfg: Config, msg: dict, batch_captured_at: str | None) -> dic
             except Exception as exc:
                 log("ERROR", f"dedup ASK failed for {slack_message_id}: {exc}")
                 return {"ok": False, "error": f"dedup check failed: {exc}"}
-            if exists:
-                log("INFO", f"duplicate: {slack_message_id} ({msg_iri})")
-                return {"ok": True, "duplicate": True, "msgIRI": msg_iri}
         else:
             try:
                 exists = ask_query(
@@ -449,9 +729,31 @@ def ingest_message(cfg: Config, msg: dict, batch_captured_at: str | None) -> dic
             except Exception as exc:
                 log("ERROR", f"dedup ASK failed for {msg_iri}: {exc}")
                 return {"ok": False, "error": f"dedup check failed: {exc}"}
-            if exists:
-                log("INFO", f"duplicate (no slackMessageId): {msg_iri}")
-                return {"ok": True, "duplicate": True, "msgIRI": msg_iri}
+
+        if exists:
+            attachments_added, bytes_added = _enrich_attachments(
+                cfg, msg_iri, attachment_plans
+            )
+            if attachments_added or bytes_added:
+                log(
+                    "INFO",
+                    f"enriched {msg_iri}"
+                    + (f" (id={slack_message_id})" if slack_message_id else "")
+                    + f" attachments_added={attachments_added} bytes_added={bytes_added}",
+                )
+            else:
+                log(
+                    "INFO",
+                    f"duplicate: {slack_message_id or msg_iri}"
+                    + f" ({msg_iri})",
+                )
+            return {
+                "ok": True,
+                "duplicate": True,
+                "msgIRI": msg_iri,
+                "attachments_added": attachments_added,
+                "bytes_added": bytes_added,
+            }
 
         try:
             post_update(cfg, sparql)
@@ -459,12 +761,25 @@ def ingest_message(cfg: Config, msg: dict, batch_captured_at: str | None) -> dic
             log("ERROR", f"INSERT failed for {msg_iri}: {exc}")
             return {"ok": False, "error": f"insert failed: {exc}"}
 
+        inserted_attachments = len(attachment_plans)
+        inserted_bytes = sum(1 for p in attachment_plans if p["bytes_triple"])
         log(
             "INFO",
             f"inserted {msg_iri}"
-            + (f" (id={slack_message_id})" if slack_message_id else ""),
+            + (f" (id={slack_message_id})" if slack_message_id else "")
+            + (
+                f" attachments_added={inserted_attachments} bytes_added={inserted_bytes}"
+                if inserted_attachments
+                else ""
+            ),
         )
-        return {"ok": True, "duplicate": False, "msgIRI": msg_iri}
+        return {
+            "ok": True,
+            "duplicate": False,
+            "msgIRI": msg_iri,
+            "attachments_added": inserted_attachments,
+            "bytes_added": inserted_bytes,
+        }
     finally:
         _locks.release(slack_message_id, lock)
 
